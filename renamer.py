@@ -12,6 +12,7 @@ Output formats:
 
 import os
 import sys
+import io
 import time
 import shutil
 import logging
@@ -26,6 +27,7 @@ from PIL import Image
 logging.getLogger("exifread").setLevel(logging.ERROR)
 
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".arw"}
+EXIF_HEADER_SIZE = 1048576  # 1MB header buffer for fast contiguous RAM parsing
 
 class PhotoInfo:
     def __init__(self, filepath: Path):
@@ -39,32 +41,34 @@ class PhotoInfo:
         self._extract_metadata()
 
     def _extract_metadata(self):
-        """Extract EXIF datetime, release mode, and sequence number via fast seeking."""
+        """Extract EXIF datetime, release mode, and sequence number from 1MB header buffer."""
         try:
             with open(self.filepath, "rb") as f:
-                # Use details=False for thread-safe ultra-fast EXIF seeking
-                tags = exifread.process_file(f, details=False, stop_tag="EXIF DateTimeOriginal")
-                
-                # Date extraction
-                for tag in ["EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"]:
-                    if tag in tags:
-                        val = str(tags[tag]).strip()
-                        try:
-                            self.dt = datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
-                            self.source = "EXIF (exifread)"
-                            break
-                        except ValueError:
-                            pass
-                
-                # Release mode & Sequence Number
-                if "MakerNote ReleaseMode" in tags:
-                    self.release_mode = str(tags["MakerNote ReleaseMode"]).strip()
-                    
-                if "MakerNote SequenceNumber" in tags:
+                header_bytes = f.read(EXIF_HEADER_SIZE)
+            
+            buf = io.BytesIO(header_bytes)
+            tags = exifread.process_file(buf, details=True)
+            
+            # Date extraction
+            for tag in ["EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"]:
+                if tag in tags:
+                    val = str(tags[tag]).strip()
                     try:
-                        self.sequence_number = int(str(tags["MakerNote SequenceNumber"]).strip())
+                        self.dt = datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
+                        self.source = "EXIF (exifread)"
+                        break
                     except ValueError:
                         pass
+            
+            # Release mode & Sequence Number
+            if "MakerNote ReleaseMode" in tags:
+                self.release_mode = str(tags["MakerNote ReleaseMode"]).strip()
+                
+            if "MakerNote SequenceNumber" in tags:
+                try:
+                    self.sequence_number = int(str(tags["MakerNote SequenceNumber"]).strip())
+                except ValueError:
+                    pass
         except Exception:
             pass
 
@@ -196,7 +200,7 @@ def process_renaming(
     recursive: bool = False, 
     verbose: bool = False
 ):
-    """Scan directory and rename or copy valid JPG/ARW files using optimal 32-worker thread pool."""
+    """Scan directory and rename or copy valid JPG/ARW files using 1MB BytesIO RAM buffering across 32 workers."""
     start_time = time.time()
 
     if not directory.exists() or not directory.is_dir():
@@ -210,9 +214,8 @@ def process_renaming(
         print(f"No matching photo files ({', '.join(VALID_EXTENSIONS)}) found in '{directory}'.")
         return
 
-    # 32 parallel workers selected based on empirical benchmark peak throughput (1,761 files/sec)
     max_workers = min(32, max(8, (os.cpu_count() or 4) * 4))
-    print(f"\nScanning EXIF metadata for {len(file_paths)} photo file(s) across {max_workers} parallel workers...")
+    print(f"\nScanning EXIF & Sony MakerNotes for {len(file_paths)} photo file(s) via 1MB RAM buffer across {max_workers} workers...")
     
     scan_start = time.time()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
