@@ -12,6 +12,7 @@ Output formats:
 
 import os
 import sys
+import time
 import shutil
 import logging
 import argparse
@@ -201,7 +202,9 @@ def process_renaming(
     recursive: bool = False, 
     verbose: bool = False
 ):
-    """Scan directory and rename or copy valid JPG/ARW files using 32 parallel workers."""
+    """Scan directory and rename or copy valid JPG/ARW files using high-concurrency parallel workers."""
+    start_time = time.time()
+
     if not directory.exists() or not directory.is_dir():
         print(f"Error: Directory '{directory}' does not exist or is not a directory.", file=sys.stderr)
         return
@@ -213,13 +216,15 @@ def process_renaming(
         print(f"No matching photo files ({', '.join(VALID_EXTENSIONS)}) found in '{directory}'.")
         return
 
-    print(f"\nScanning EXIF metadata for {len(file_paths)} photo file(s) across parallel workers...")
+    # Scale worker threads up to 128 for maximum parallel disk scanning speed
+    max_workers = min(128, max(32, (os.cpu_count() or 4) * 8))
+    print(f"\nScanning EXIF metadata for {len(file_paths)} photo file(s) across {max_workers} parallel workers...")
     
-    # Parallelize EXIF extraction across 32 worker threads
-    max_workers = min(32, max(16, (os.cpu_count() or 4) * 4))
+    scan_start = time.time()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         photos = list(executor.map(PhotoInfo, file_paths))
-    
+    scan_elapsed = time.time() - scan_start
+
     resolved_output_dir = Path(output_dir).resolve() if output_dir else None
 
     # Generate grouped target filenames with disk collision protection
@@ -271,10 +276,14 @@ def process_renaming(
         else:
             renamed_count += 1
 
+    total_elapsed = time.time() - start_time
+
     print("\nSummary:")
     print(f"  Total files evaluated: {len(file_paths)}")
     print(f"  Files {'proposed to process' if dry_run else ('copied' if resolved_output_dir else 'renamed')}: {renamed_count}")
     print(f"  Files skipped: {skipped_count}")
+    print(f"  EXIF metadata scan time: {scan_elapsed:.2f} seconds ({len(file_paths)/scan_elapsed:.1f} files/sec)")
+    print(f"  Total execution time: {total_elapsed:.2f} seconds ({len(file_paths)/total_elapsed:.1f} files/sec)")
 
 def main():
     parser = argparse.ArgumentParser(
