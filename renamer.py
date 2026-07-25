@@ -63,11 +63,14 @@ class PhotoInfo:
                     for elem in tree.getroot().iter():
                         if "CreationDate" in elem.tag and "value" in elem.attrib:
                             dt_val = str(elem.attrib["value"]).strip()
-                            self.dt = datetime.fromisoformat(dt_val)
+                            dt_obj = datetime.fromisoformat(dt_val)
+                            self.dt = dt_obj.replace(tzinfo=None)
                             self.source = "XML Sidecar"
                             break
                 except Exception:
                     pass
+            if self.dt and self.dt.tzinfo is not None:
+                self.dt = self.dt.replace(tzinfo=None)
             return
 
         # --- PHOTO METADATA (.JPG / .ARW) ---
@@ -121,6 +124,9 @@ class PhotoInfo:
 
         if "Continuous" in self.release_mode or (self.sequence_number is not None and self.sequence_number > 0):
             self.is_burst = True
+
+        if self.dt and self.dt.tzinfo is not None:
+            self.dt = self.dt.replace(tzinfo=None)
 
 def group_burst_photos(photos: list[PhotoInfo], dest_dir: Path | None = None) -> list[tuple[PhotoInfo, str]]:
     """
@@ -228,17 +234,22 @@ def process_renaming(
     dry_run: bool = False, 
     recursive: bool = False, 
     fast_skip: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    move: bool = False
 ):
-    """Scan directory and rename or copy valid JPG/ARW/MP4 files using 32 parallel workers."""
+    """Scan directory and rename, copy, or move valid JPG/ARW/MP4 files using 32 parallel workers."""
     start_time = time.time()
 
     if not directory.exists() or not directory.is_dir():
         print(f"Error: Directory '{directory}' does not exist or is not a directory.", file=sys.stderr)
         return
 
+    print(f"\n[STEP 1/4] Discovering media files in '{directory}' (recursive={recursive})...")
     pattern = "**/*" if recursive else "*"
-    all_file_paths = [p for p in directory.glob(pattern) if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS]
+    all_file_paths = [
+        p for p in directory.glob(pattern)
+        if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS and "THMBNL" not in [part.upper() for part in p.parts]
+    ]
     
     if not all_file_paths:
         print(f"No matching photo/video files ({', '.join(VALID_EXTENSIONS)}) found in '{directory}'.")
@@ -253,9 +264,10 @@ def process_renaming(
                 skipped_formatted_count += 1
             else:
                 file_paths.append(p)
-        print(f"\n[FAST-SKIP] Quickly skipped {skipped_formatted_count} file(s) matching formatted filename pattern.")
+        print(f"  -> Found {len(all_file_paths)} files total. Fast-skipped {skipped_formatted_count} already formatted file(s).")
     else:
         file_paths = all_file_paths
+        print(f"  -> Found {len(all_file_paths)} media file(s) to process.")
 
     if not file_paths:
         total_elapsed = time.time() - start_time
@@ -280,7 +292,7 @@ def process_renaming(
                     break
 
     max_workers = min(32, max(8, (os.cpu_count() or 4) * 4))
-    print(f"Scanning metadata for {len(file_paths)} un-renamed photo & video file(s) across {max_workers} parallel workers...")
+    print(f"\n[STEP 2/4] Extracting EXIF/XML metadata for {len(file_paths)} file(s) across {max_workers} parallel workers...")
     
     def process_item(p: Path) -> PhotoInfo:
         return PhotoInfo(p, xml_sidecar=xml_map.get(p))
@@ -289,29 +301,33 @@ def process_renaming(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         photos = list(executor.map(process_item, file_paths))
     scan_elapsed = time.time() - scan_start
+    print(f"  -> Metadata extraction complete in {scan_elapsed:.3f}s ({len(file_paths)/scan_elapsed:.1f} files/sec).")
 
     resolved_output_dir = Path(output_dir).resolve() if output_dir else None
 
-    # Generate grouped target filenames with disk collision protection
+    print(f"\n[STEP 3/4] Grouping burst sequences & resolving target filenames...")
     photo_plan = group_burst_photos(photos, dest_dir=resolved_output_dir)
+    print(f"  -> Generated execution plan for {len(photo_plan)} items.")
 
     if resolved_output_dir:
         if not dry_run:
             resolved_output_dir.mkdir(parents=True, exist_ok=True)
-        operation_mode = f"COPY to '{resolved_output_dir}'"
+        operation_mode = f"MOVE to '{resolved_output_dir}'" if move else f"COPY to '{resolved_output_dir}'"
     else:
         operation_mode = "RENAME in-place"
 
     if dry_run:
-        print(f"=== DRY RUN MODE (Preview {operation_mode}) ===\n")
+        print(f"\n[STEP 4/4] Previewing changes (DRY-RUN MODE for {operation_mode})...\n")
     else:
-        print(f"=== EXECUTING {operation_mode.upper()} ===\n")
+        print(f"\n[STEP 4/4] Executing {operation_mode.upper()} for {len(photo_plan)} file(s)...\n")
 
     renamed_count = 0
     skipped_count = skipped_formatted_count
+    total_plan = len(photo_plan)
+    log_interval = max(500, total_plan // 10)
 
     # Sort output log display by target filename
-    for photo, target_filename in sorted(photo_plan, key=lambda pair: pair[1]):
+    for idx, (photo, target_filename) in enumerate(sorted(photo_plan, key=lambda pair: pair[1]), start=1):
         filepath = photo.filepath
         
         if resolved_output_dir:
@@ -325,15 +341,27 @@ def process_renaming(
             skipped_count += 1
             continue
 
-        action_label = "[DRY-RUN]" if dry_run else ("[COPY]" if resolved_output_dir else "[RENAME]")
+        if move and resolved_output_dir:
+            action_type = "[MOVE]"
+        elif resolved_output_dir:
+            action_type = "[COPY]"
+        else:
+            action_type = "[RENAME]"
+
+        action_label = "[DRY-RUN]" if dry_run else action_type
         burst_info = f" (Burst Frame {photo.sequence_number})" if photo.sequence_number else ""
         xml_info = f" + paired {photo.xml_sidecar.name}" if photo.xml_sidecar else ""
-        print(f"{action_label} {filepath.name:45s} -> {target_filename} ({photo.source}{burst_info}{xml_info})")
+
+        if verbose or dry_run or total_plan <= 50:
+            print(f"{action_label} {filepath.name:45s} -> {target_filename} ({photo.source}{burst_info}{xml_info})")
 
         if not dry_run:
             try:
                 if resolved_output_dir:
-                    shutil.copy2(filepath, target_path)
+                    if move:
+                        shutil.move(filepath, target_path)
+                    else:
+                        shutil.copy2(filepath, target_path)
                 else:
                     filepath.rename(target_path)
                 
@@ -343,7 +371,10 @@ def process_renaming(
                     xml_target_name = f"{xml_stem}M01.xml"
                     xml_target_path = target_path.parent / xml_target_name
                     if resolved_output_dir:
-                        shutil.copy2(photo.xml_sidecar, xml_target_path)
+                        if move:
+                            shutil.move(photo.xml_sidecar, xml_target_path)
+                        else:
+                            shutil.copy2(photo.xml_sidecar, xml_target_path)
                     else:
                         photo.xml_sidecar.rename(xml_target_path)
                 
@@ -353,11 +384,17 @@ def process_renaming(
         else:
             renamed_count += 1
 
+        if not (verbose or dry_run or total_plan <= 50):
+            if idx % log_interval == 0 or idx == total_plan:
+                progress_pct = (idx / total_plan) * 100
+                print(f"  [PROGRESS] Processed {idx}/{total_plan} files ({progress_pct:.1f}%)...")
+
     total_elapsed = time.time() - start_time
 
+    action_verb = "moved" if (move and resolved_output_dir) else ("copied" if resolved_output_dir else "renamed")
     print("\nSummary:")
     print(f"  Total files evaluated: {len(all_file_paths)}")
-    print(f"  Files {'proposed to process' if dry_run else ('copied' if resolved_output_dir else 'renamed')}: {renamed_count}")
+    print(f"  Files {'proposed to process' if dry_run else action_verb}: {renamed_count}")
     print(f"  Files skipped: {skipped_count}")
     print(f"  Metadata scan time: {scan_elapsed:.3f} seconds ({len(file_paths)/scan_elapsed:.1f} files/sec)")
     print(f"  Total execution time: {total_elapsed:.3f} seconds ({len(all_file_paths)/total_elapsed:.1f} files/sec)")
@@ -376,6 +413,11 @@ def main():
         "-o", "--output-dir",
         default=None,
         help="Output directory to save processed files (instead of renaming in-place)."
+    )
+    parser.add_argument(
+        "-m", "--move",
+        action="store_true",
+        help="Move files to output directory instead of copying them."
     )
     parser.add_argument(
         "-n", "--dry-run",
@@ -408,7 +450,8 @@ def main():
         dry_run=args.dry_run,
         recursive=args.recursive,
         fast_skip=args.fast_skip,
-        verbose=args.verbose
+        verbose=args.verbose,
+        move=args.move
     )
 
 if __name__ == "__main__":
