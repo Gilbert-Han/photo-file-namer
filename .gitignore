@@ -1,0 +1,23 @@
+# Testing data and sample photo folders
+testing/
+20251127/
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.arw
+*.ARW
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# System and IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
