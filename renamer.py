@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Photo Renamer Tool
-------------------
-High-performance multithreaded tool to rename or copy JPG and Sony RAW (.ARW) photos
-based on EXIF metadata creation timestamp and Sony burst sequence detection.
+Photo & Video Renamer Tool
+--------------------------
+High-performance multithreaded tool to rename or copy JPG, Sony RAW (.ARW),
+and MP4 video files (with paired XML sidecars) based on EXIF/XML metadata creation timestamps
+and Sony burst sequence detection.
 
 Output formats:
-- Single photos: YYYY-MM-DD-unixtimestamp.<ext>
-- Burst photos: YYYY-MM-DD-unixtimestamp_b01.<ext>, YYYY-MM-DD-unixtimestamp_b02.<ext>
+- Photos/Videos: YYYY-MM-DD-unixtimestamp.<ext>
+- Burst photos:  YYYY-MM-DD-unixtimestamp_b01.<ext>, YYYY-MM-DD-unixtimestamp_b02.<ext>
+- Video Sidecars: YYYY-MM-DD-unixtimestampM01.xml
 """
 
 import os
 import sys
 import io
+import re
 import time
 import shutil
 import logging
 import argparse
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -26,22 +30,47 @@ from PIL import Image
 # Suppress exifread warnings/corrupted tag log noise
 logging.getLogger("exifread").setLevel(logging.ERROR)
 
-VALID_EXTENSIONS = {".jpg", ".jpeg", ".arw"}
+VALID_EXTENSIONS = {".jpg", ".jpeg", ".arw", ".mp4"}
 EXIF_HEADER_SIZE = 1048576  # 1MB header buffer for fast contiguous RAM parsing
 
+# Regex pattern matching filenames that are already formatted (YYYY-MM-DD-unixtimestamp...)
+ALREADY_FORMATTED_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}-\d+(_b\d+)?(_\d+)?\.(jpg|jpeg|arw|mp4)$",
+    re.IGNORECASE
+)
+
 class PhotoInfo:
-    def __init__(self, filepath: Path):
+    def __init__(self, filepath: Path, xml_sidecar: Path | None = None):
         self.filepath = filepath
         self.dt: datetime = datetime.fromtimestamp(filepath.stat().st_mtime)
         self.source: str = "File mtime (Fallback)"
         self.release_mode: str = ""
         self.sequence_number: int | None = None
         self.is_burst: bool = False
+        self.xml_sidecar: Path | None = xml_sidecar
         
         self._extract_metadata()
 
     def _extract_metadata(self):
-        """Extract EXIF datetime, release mode, and sequence number from 1MB header buffer."""
+        """Extract creation date from EXIF (for photos) or XML sidecar (for videos)."""
+        ext = self.filepath.suffix.lower()
+        
+        # --- VIDEO METADATA (.MP4) ---
+        if ext == ".mp4":
+            if self.xml_sidecar and self.xml_sidecar.exists():
+                try:
+                    tree = ET.parse(self.xml_sidecar)
+                    for elem in tree.getroot().iter():
+                        if "CreationDate" in elem.tag and "value" in elem.attrib:
+                            dt_val = str(elem.attrib["value"]).strip()
+                            self.dt = datetime.fromisoformat(dt_val)
+                            self.source = "XML Sidecar"
+                            break
+                except Exception:
+                    pass
+            return
+
+        # --- PHOTO METADATA (.JPG / .ARW) ---
         try:
             with open(self.filepath, "rb") as f:
                 header_bytes = f.read(EXIF_HEADER_SIZE)
@@ -156,7 +185,7 @@ def group_burst_photos(photos: list[PhotoInfo], dest_dir: Path | None = None) ->
                 target_filename = f"{base_name}_b{frame_num:0{pad}d}{ext}"
                 results.append((p, target_filename))
         else:
-            # Single non-burst photo
+            # Single non-burst photo or video
             ext = photo.filepath.suffix.lower()
             date_prefix = photo.dt.strftime("%Y-%m-%d")
             unix_ts = int(photo.dt.timestamp())
@@ -198,9 +227,10 @@ def process_renaming(
     output_dir: Path | None = None,
     dry_run: bool = False, 
     recursive: bool = False, 
+    fast_skip: bool = False,
     verbose: bool = False
 ):
-    """Scan directory and rename or copy valid JPG/ARW files using 1MB BytesIO RAM buffering across 32 workers."""
+    """Scan directory and rename or copy valid JPG/ARW/MP4 files using 32 parallel workers."""
     start_time = time.time()
 
     if not directory.exists() or not directory.is_dir():
@@ -208,18 +238,56 @@ def process_renaming(
         return
 
     pattern = "**/*" if recursive else "*"
-    file_paths = [p for p in directory.glob(pattern) if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS]
+    all_file_paths = [p for p in directory.glob(pattern) if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS]
     
-    if not file_paths:
-        print(f"No matching photo files ({', '.join(VALID_EXTENSIONS)}) found in '{directory}'.")
+    if not all_file_paths:
+        print(f"No matching photo/video files ({', '.join(VALID_EXTENSIONS)}) found in '{directory}'.")
         return
 
+    skipped_formatted_count = 0
+    file_paths: list[Path] = []
+
+    if fast_skip:
+        for p in all_file_paths:
+            if ALREADY_FORMATTED_PATTERN.match(p.name):
+                skipped_formatted_count += 1
+            else:
+                file_paths.append(p)
+        print(f"\n[FAST-SKIP] Quickly skipped {skipped_formatted_count} file(s) matching formatted filename pattern.")
+    else:
+        file_paths = all_file_paths
+
+    if not file_paths:
+        total_elapsed = time.time() - start_time
+        print(f"\nAll {len(all_file_paths)} file(s) are already in target YYYY-MM-DD format.")
+        print(f"Summary:")
+        print(f"  Total files evaluated: {len(all_file_paths)}")
+        print(f"  Files processed: 0")
+        print(f"  Files fast-skipped: {skipped_formatted_count}")
+        print(f"  Total execution time: {total_elapsed:.3f} seconds")
+        return
+
+    # Build fast in-memory map of existing XML sidecars in the target directory
+    xml_map: dict[Path, Path] = {}
+    for p in file_paths:
+        if p.suffix.lower() == ".mp4":
+            stem = p.stem
+            parent = p.parent
+            for possible_name in [f"{stem}M01.XML", f"{stem}M01.xml", f"{stem}.XML", f"{stem}.xml"]:
+                candidate = parent / possible_name
+                if candidate.exists():
+                    xml_map[p] = candidate
+                    break
+
     max_workers = min(32, max(8, (os.cpu_count() or 4) * 4))
-    print(f"\nScanning EXIF & Sony MakerNotes for {len(file_paths)} photo file(s) via 1MB RAM buffer across {max_workers} workers...")
+    print(f"Scanning metadata for {len(file_paths)} un-renamed photo & video file(s) across {max_workers} parallel workers...")
     
+    def process_item(p: Path) -> PhotoInfo:
+        return PhotoInfo(p, xml_sidecar=xml_map.get(p))
+
     scan_start = time.time()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        photos = list(executor.map(PhotoInfo, file_paths))
+        photos = list(executor.map(process_item, file_paths))
     scan_elapsed = time.time() - scan_start
 
     resolved_output_dir = Path(output_dir).resolve() if output_dir else None
@@ -240,7 +308,7 @@ def process_renaming(
         print(f"=== EXECUTING {operation_mode.upper()} ===\n")
 
     renamed_count = 0
-    skipped_count = 0
+    skipped_count = skipped_formatted_count
 
     # Sort output log display by target filename
     for photo, target_filename in sorted(photo_plan, key=lambda pair: pair[1]):
@@ -259,7 +327,8 @@ def process_renaming(
 
         action_label = "[DRY-RUN]" if dry_run else ("[COPY]" if resolved_output_dir else "[RENAME]")
         burst_info = f" (Burst Frame {photo.sequence_number})" if photo.sequence_number else ""
-        print(f"{action_label} {filepath.name:45s} -> {target_filename} ({photo.source}{burst_info})")
+        xml_info = f" + paired {photo.xml_sidecar.name}" if photo.xml_sidecar else ""
+        print(f"{action_label} {filepath.name:45s} -> {target_filename} ({photo.source}{burst_info}{xml_info})")
 
         if not dry_run:
             try:
@@ -267,6 +336,17 @@ def process_renaming(
                     shutil.copy2(filepath, target_path)
                 else:
                     filepath.rename(target_path)
+                
+                # Also copy or rename paired XML sidecar if present
+                if photo.xml_sidecar and photo.xml_sidecar.exists():
+                    xml_stem = Path(target_filename).stem
+                    xml_target_name = f"{xml_stem}M01.xml"
+                    xml_target_path = target_path.parent / xml_target_name
+                    if resolved_output_dir:
+                        shutil.copy2(photo.xml_sidecar, xml_target_path)
+                    else:
+                        photo.xml_sidecar.rename(xml_target_path)
+                
                 renamed_count += 1
             except Exception as e:
                 print(f"  [ERROR] Could not process {filepath.name}: {e}", file=sys.stderr)
@@ -276,21 +356,21 @@ def process_renaming(
     total_elapsed = time.time() - start_time
 
     print("\nSummary:")
-    print(f"  Total files evaluated: {len(file_paths)}")
+    print(f"  Total files evaluated: {len(all_file_paths)}")
     print(f"  Files {'proposed to process' if dry_run else ('copied' if resolved_output_dir else 'renamed')}: {renamed_count}")
     print(f"  Files skipped: {skipped_count}")
-    print(f"  EXIF metadata scan time: {scan_elapsed:.3f} seconds ({len(file_paths)/scan_elapsed:.1f} files/sec)")
-    print(f"  Total execution time: {total_elapsed:.3f} seconds ({len(file_paths)/total_elapsed:.1f} files/sec)")
+    print(f"  Metadata scan time: {scan_elapsed:.3f} seconds ({len(file_paths)/scan_elapsed:.1f} files/sec)")
+    print(f"  Total execution time: {total_elapsed:.3f} seconds ({len(all_file_paths)/total_elapsed:.1f} files/sec)")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Rename JPG and ARW photos based on EXIF metadata & burst grouping."
+        description="Rename JPG, ARW, and MP4 files based on EXIF/XML metadata & burst grouping."
     )
     parser.add_argument(
         "directory",
         nargs="?",
         default=".",
-        help="Path to folder containing photos (defaults to current directory)."
+        help="Path to folder containing photos/videos (defaults to current directory)."
     )
     parser.add_argument(
         "-o", "--output-dir",
@@ -308,6 +388,11 @@ def main():
         help="Process subdirectories recursively."
     )
     parser.add_argument(
+        "-f", "--fast-skip",
+        action="store_true",
+        help="Quickly skip files whose filenames already match the target YYYY-MM-DD pattern without opening EXIF headers."
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Show detailed output for skipped files."
@@ -322,6 +407,7 @@ def main():
         output_dir=output_dir,
         dry_run=args.dry_run,
         recursive=args.recursive,
+        fast_skip=args.fast_skip,
         verbose=args.verbose
     )
 
