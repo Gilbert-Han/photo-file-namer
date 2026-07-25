@@ -2,10 +2,12 @@
 """
 Photo Renamer Tool
 ------------------
-Renames or copies JPG and Sony RAW (.ARW) photos based on EXIF metadata creation timestamp.
+High-performance multithreaded tool to rename or copy JPG and Sony RAW (.ARW) photos
+based on EXIF metadata creation timestamp and Sony burst sequence detection.
+
+Output formats:
 - Single photos: YYYY-MM-DD-unixtimestamp.<ext>
 - Burst photos: YYYY-MM-DD-unixtimestamp_b01.<ext>, YYYY-MM-DD-unixtimestamp_b02.<ext>
-  (Groups all photos in a burst series to the earliest image's base timestamp)
 """
 
 import os
@@ -15,6 +17,7 @@ import logging
 import argparse
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import exifread
 from PIL import Image
 
@@ -35,10 +38,10 @@ class PhotoInfo:
         self._extract_metadata()
 
     def _extract_metadata(self):
-        """Extract EXIF datetime, release mode, and sequence number."""
+        """Extract EXIF datetime, release mode, and sequence number via fast seeking."""
         try:
             with open(self.filepath, "rb") as f:
-                # Redirect stderr temporarily to silence C-level warnings from exifread parser
+                # Silence C-level warnings from exifread parser
                 old_stderr = sys.stderr
                 sys.stderr = open(os.devnull, "w")
                 try:
@@ -117,7 +120,6 @@ def group_burst_photos(photos: list[PhotoInfo], dest_dir: Path | None = None) ->
         if photo.is_burst:
             burst_group: list[PhotoInfo] = []
             
-            # Identify burst group: sequence number 1 or consecutive files with short time gap
             start_photo = photo
             burst_group.append(photo)
             i += 1
@@ -173,14 +175,12 @@ def group_burst_photos(photos: list[PhotoInfo], dest_dir: Path | None = None) ->
         
         counter = 1
         stem = Path(target).stem
-        
         target_folder = dest_dir if dest_dir else photo.filepath.parent
         
         def is_taken(name: str) -> bool:
             if name.lower() in used_names:
                 return True
             check_path = target_folder / name
-            # Check if file exists on disk and is NOT the file itself being renamed in-place
             if check_path.exists() and check_path.resolve() != photo.filepath.resolve():
                 return True
             return False
@@ -201,7 +201,7 @@ def process_renaming(
     recursive: bool = False, 
     verbose: bool = False
 ):
-    """Scan directory and rename or copy valid JPG/ARW files."""
+    """Scan directory and rename or copy valid JPG/ARW files using 32 parallel workers."""
     if not directory.exists() or not directory.is_dir():
         print(f"Error: Directory '{directory}' does not exist or is not a directory.", file=sys.stderr)
         return
@@ -213,8 +213,12 @@ def process_renaming(
         print(f"No matching photo files ({', '.join(VALID_EXTENSIONS)}) found in '{directory}'.")
         return
 
-    print(f"\nScanning EXIF metadata for {len(file_paths)} photo file(s)...")
-    photos = [PhotoInfo(p) for p in file_paths]
+    print(f"\nScanning EXIF metadata for {len(file_paths)} photo file(s) across parallel workers...")
+    
+    # Parallelize EXIF extraction across 32 worker threads
+    max_workers = min(32, max(16, (os.cpu_count() or 4) * 4))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        photos = list(executor.map(PhotoInfo, file_paths))
     
     resolved_output_dir = Path(output_dir).resolve() if output_dir else None
 
@@ -290,7 +294,7 @@ def main():
     parser.add_argument(
         "-n", "--dry-run",
         action="store_true",
-        help="Preview renaming actions without modifying any files."
+        help="Preview renaming actions without renaming any files."
     )
     parser.add_argument(
         "-r", "--recursive",
