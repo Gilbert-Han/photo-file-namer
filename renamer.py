@@ -255,16 +255,19 @@ def process_renaming(
         print(f"No matching photo/video files ({', '.join(VALID_EXTENSIONS)}) found in '{directory}'.")
         return
 
+    resolved_output_dir = Path(output_dir).resolve() if output_dir else None
+
     skipped_formatted_count = 0
     file_paths: list[Path] = []
 
     if fast_skip:
         for p in all_file_paths:
-            if ALREADY_FORMATTED_PATTERN.match(p.name):
+            is_in_target_dir = (resolved_output_dir is None and p.parent.resolve() == directory.resolve()) or (resolved_output_dir is not None and p.parent.resolve() == resolved_output_dir)
+            if ALREADY_FORMATTED_PATTERN.match(p.name) and is_in_target_dir:
                 skipped_formatted_count += 1
             else:
                 file_paths.append(p)
-        print(f"  -> Found {len(all_file_paths)} files total. Fast-skipped {skipped_formatted_count} already formatted file(s).")
+        print(f"  -> Found {len(all_file_paths)} files total. Fast-skipped {skipped_formatted_count} file(s) already in output directory.")
     else:
         file_paths = all_file_paths
         print(f"  -> Found {len(all_file_paths)} media file(s) to process.")
@@ -390,6 +393,21 @@ def process_renaming(
                 print(f"  [PROGRESS] Processed {idx}/{total_plan} files ({progress_pct:.1f}%)...")
 
     total_elapsed = time.time() - start_time
+
+    if move and not dry_run and directory.exists():
+        empty_dirs_removed = 0
+        for root, dirs, files in os.walk(directory, topdown=False):
+            for d in dirs:
+                dir_path = Path(root) / d
+                if resolved_output_dir and dir_path.resolve() == resolved_output_dir:
+                    continue
+                try:
+                    dir_path.rmdir()
+                    empty_dirs_removed += 1
+                except OSError:
+                    pass
+        if empty_dirs_removed > 0:
+            print(f"  Cleaned up {empty_dirs_removed} empty subdirectory(ies).")
 
     action_verb = "moved" if (move and resolved_output_dir) else ("copied" if resolved_output_dir else "renamed")
     print("\nSummary:")
