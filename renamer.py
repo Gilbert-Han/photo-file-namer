@@ -42,15 +42,8 @@ class PhotoInfo:
         """Extract EXIF datetime, release mode, and sequence number via fast seeking."""
         try:
             with open(self.filepath, "rb") as f:
-                # Silence C-level warnings from exifread parser
-                old_stderr = sys.stderr
-                sys.stderr = open(os.devnull, "w")
-                try:
-                    # Use details=False for 220x faster EXIF seeking
-                    tags = exifread.process_file(f, details=False, stop_tag="EXIF DateTimeOriginal")
-                finally:
-                    sys.stderr.close()
-                    sys.stderr = old_stderr
+                # Use details=False for thread-safe ultra-fast EXIF seeking
+                tags = exifread.process_file(f, details=False, stop_tag="EXIF DateTimeOriginal")
                 
                 # Date extraction
                 for tag in ["EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"]:
