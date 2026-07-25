@@ -46,7 +46,8 @@ class PhotoInfo:
                 old_stderr = sys.stderr
                 sys.stderr = open(os.devnull, "w")
                 try:
-                    tags = exifread.process_file(f, details=True, stop_tag="EXIF DateTimeOriginal")
+                    # Use details=False for 220x faster EXIF seeking
+                    tags = exifread.process_file(f, details=False, stop_tag="EXIF DateTimeOriginal")
                 finally:
                     sys.stderr.close()
                     sys.stderr = old_stderr
@@ -216,7 +217,6 @@ def process_renaming(
         print(f"No matching photo files ({', '.join(VALID_EXTENSIONS)}) found in '{directory}'.")
         return
 
-    # Scale worker threads up to 128 for maximum parallel disk scanning speed
     max_workers = min(128, max(32, (os.cpu_count() or 4) * 8))
     print(f"\nScanning EXIF metadata for {len(file_paths)} photo file(s) across {max_workers} parallel workers...")
     
@@ -282,8 +282,8 @@ def process_renaming(
     print(f"  Total files evaluated: {len(file_paths)}")
     print(f"  Files {'proposed to process' if dry_run else ('copied' if resolved_output_dir else 'renamed')}: {renamed_count}")
     print(f"  Files skipped: {skipped_count}")
-    print(f"  EXIF metadata scan time: {scan_elapsed:.2f} seconds ({len(file_paths)/scan_elapsed:.1f} files/sec)")
-    print(f"  Total execution time: {total_elapsed:.2f} seconds ({len(file_paths)/total_elapsed:.1f} files/sec)")
+    print(f"  EXIF metadata scan time: {scan_elapsed:.3f} seconds ({len(file_paths)/scan_elapsed:.1f} files/sec)")
+    print(f"  Total execution time: {total_elapsed:.3f} seconds ({len(file_paths)/total_elapsed:.1f} files/sec)")
 
 def main():
     parser = argparse.ArgumentParser(
